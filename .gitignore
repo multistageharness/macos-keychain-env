@@ -1,0 +1,10 @@
+node_modules/
+*.tgz
+.DS_Store
+
+# Plaintext env files must never be committed. The .env.keychain manifest holds
+# only keychain:// references and is meant to be committed.
+.env
+.env.*
+!.env.keychain
+!.env.example

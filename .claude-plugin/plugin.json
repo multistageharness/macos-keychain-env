@@ -1,0 +1,5 @@
+{
+  "name": "macos-keychain-env",
+  "description": "Keep project secrets in the macOS keychain instead of .env files: agent skill plus the keychain-env CLI.",
+  "version": "0.1.0"
+}

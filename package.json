@@ -1,0 +1,46 @@
+{
+  "name": "macos-keychain-env",
+  "version": "0.1.0",
+  "description": "Load secrets from the macOS keychain instead of .env files — async/sync API, preload hook, and CLI for apps, CLIs and SDKs.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./register": "./src/register.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "keychain-env": "bin/keychain-env.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "index.d.ts",
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "test:integration": "KEYCHAIN_ENV_INTEGRATION=1 node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "keywords": [
+    "keychain",
+    "macos",
+    "secrets",
+    "dotenv",
+    "env",
+    "security",
+    "credentials"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/multistageharness/macos-keychain-env.git"
+  }
+}
