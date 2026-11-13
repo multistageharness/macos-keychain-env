@@ -116,6 +116,24 @@ global: --keychain <path>  --timeout <ms>
 `set` has no value argument on purpose: values come from a hidden prompt, stdin, or
 the clipboard, so they never end up in shell history.
 
+### Bash scripts (no Node required)
+
+Standalone scripts in `bin/` call `/usr/bin/security` directly, with the same
+safeguards (stdin hex writes, line-limit check, `-g` parsing). They work with macOS's
+built-in bash 3.2.
+
+```bash
+bin/keychain-add.sh    <service> <account> [--stdin | --from-clipboard] [--keychain p] [--allow-argv]   # fails if it exists
+bin/keychain-update.sh <service> <account> [--stdin | --from-clipboard] [--keychain p] [--allow-argv]   # fails if missing
+bin/keychain-get.sh    <service> <account> [--keychain p]                                              # prints value
+
+API_KEY="$(bin/keychain-get.sh my-project API_KEY)" ./server
+```
+
+Without `--stdin` or `--from-clipboard`, add and update prompt twice with hidden input
+when run in a terminal, and read stdin otherwise. Exit codes: 0 success, 1 error
+(not found, already exists, too large, …), 2 usage.
+
 ## Security notes
 
 - Values are passed to `security` as hex **over stdin** (`security -i`), never argv.

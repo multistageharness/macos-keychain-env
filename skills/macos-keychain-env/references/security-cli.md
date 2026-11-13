@@ -2,6 +2,11 @@
 
 Use these when `keychain-env` is unavailable. They're verified on macOS.
 
+If this repo is available, prefer its standalone bash scripts, which handle the
+pitfalls below: `bin/keychain-add.sh`, `bin/keychain-update.sh`, and
+`bin/keychain-get.sh` (all take `<service> <account>`; add and update read the value
+from a hidden prompt, `--stdin`, or `--from-clipboard`).
+
 ```bash
 # Exists? (reads no secret data; exit 0 = yes, 44 = not found)
 security find-generic-password -s my-project -a OPENAI_API_KEY >/dev/null 2>&1; echo $?
