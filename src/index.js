@@ -9,6 +9,8 @@ import { createKeychain } from './client.js';
 export { createKeychain } from './client.js';
 export { KeychainError, MissingSecretsError, SecretNotFoundError } from './errors.js';
 export { DEFAULT_MANIFEST, formatRef, isRef, parseDotenv, parseManifest, parseRef, readManifest } from './refs.js';
+export { redact } from './errors.js';
+export { defaultTrustStore, trustManifest, untrustManifest } from './trust.js';
 
 export const keychain = createKeychain();
 

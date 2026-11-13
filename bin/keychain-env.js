@@ -16,7 +16,16 @@ import {
   parseDotenv,
   parseManifest,
   parseRef,
+  trustManifest,
+  untrustManifest,
 } from '../src/index.js';
+import { validateEnvName } from '../src/refs.js';
+import { safeEnv } from '../src/security.js';
+import { assertManifestTrusted, defaultTrustStore, loadManifest } from '../src/trust.js';
+
+// Absolute paths: never resolve helper binaries through PATH.
+const PBPASTE = '/usr/bin/pbpaste';
+const PBCOPY = '/usr/bin/pbcopy';
 
 const USAGE = `keychain-env — use the macOS keychain instead of .env files
 
@@ -30,6 +39,8 @@ Usage:
   keychain-env import <file> --service <name>      Move values from a .env file into the keychain
                                                    and write keychain:// references to the manifest
   keychain-env ref <service> <account>             Print the keychain:// reference for an item
+  keychain-env trust [--manifest f] [--yes]        Review and approve a manifest (required before use)
+  keychain-env untrust [--manifest f]              Revoke a manifest approval
 
 <service> <account> may also be given as one keychain://service/account URI.
 
@@ -46,15 +57,40 @@ Options:
   --comment <text>     set: keychain item comment
   --allow-argv         set/import: allow values over ~1.9 KB, passed to security via argv
   --keys A,B           import: only import these variables
+  --allow-service <s>  Only allow these services (repeatable or comma-separated); also permits
+                       keychain:// values from the environment that name them
+  --yes                trust: approve without the interactive confirmation
   --timeout <ms>       Per-operation timeout (default 30000)
   --json               check: machine-readable output
+
+Trust:
+  A manifest can name ANY keychain item, so run/check/the Node preload refuse a manifest until
+  you approve it with \`keychain-env trust\`. The approval pins its content and services; any edit
+  requires approving again. keychain:// values found in the environment (e.g. a .env file) may only
+  name services that a trusted manifest or --allow-service already permits.
+
+Advanced (testing):
+  --security-bin <abs path>   Use another security binary (must be owned by you/root, not writable by others)
+  --trust-store <abs path>    Use another trust store file
 
 Environment:
   Variables already set in the environment win over the keychain unless --override is used,
   so CI and non-macOS systems can provide them directly.
 `;
 
-const FLAGS_WITH_VALUE = new Set(['keychain', 'manifest', 'service', 'label', 'comment', 'keys', 'timeout']);
+const FLAGS_WITH_VALUE = new Set([
+  'keychain',
+  'manifest',
+  'service',
+  'label',
+  'comment',
+  'keys',
+  'timeout',
+  'allow-service',
+  'security-bin',
+  'trust-store',
+]);
+const REPEATABLE = new Set(['allow-service']);
 const BOOLEAN_FLAGS = new Set([
   'no-manifest',
   'override',
@@ -63,6 +99,7 @@ const BOOLEAN_FLAGS = new Set([
   'clear-clipboard',
   'allow-argv',
   'json',
+  'yes',
   'help',
 ]);
 
@@ -85,7 +122,8 @@ function parseArgs(argv) {
       if (FLAGS_WITH_VALUE.has(name)) {
         const value = inline ?? argv[++i];
         if (value === undefined) throw new UsageError(`--${name} needs a value`);
-        flags[name] = value;
+        if (REPEATABLE.has(name)) (flags[name] ??= []).push(...value.split(',').map((v) => v.trim()).filter(Boolean));
+        else flags[name] = value;
       } else if (BOOLEAN_FLAGS.has(name)) {
         flags[name] = true;
       } else {
@@ -146,7 +184,7 @@ function promptHidden(question) {
 
 async function readSecretValue(flags, ref) {
   if (flags['from-clipboard']) {
-    return stripOneNewline(execFileSync('pbpaste', { encoding: 'utf8' }));
+    return stripOneNewline(execFileSync(PBPASTE, { encoding: 'utf8', env: safeEnv() }));
   }
   if (flags.stdin || !process.stdin.isTTY) return stripOneNewline(await readStdin());
   const first = await promptHidden(`Value for ${ref.service}/${ref.account}: `);
@@ -167,7 +205,29 @@ function envOptions(flags) {
     manifest: flags['no-manifest'] ? false : flags.manifest,
     service: flags.service,
     timeoutMs: timeoutOf(flags),
+    allowedServices: flags['allow-service'],
+    trustStore: flags['trust-store'],
   };
+}
+
+function trustStoreOf(flags) {
+  const store = flags['trust-store'] ?? defaultTrustStore();
+  if (!path.isAbsolute(store)) throw new UsageError('--trust-store must be an absolute path');
+  return store;
+}
+
+async function confirm(question) {
+  if (!process.stdin.isTTY) return false;
+  process.stderr.write(question);
+  const answer = await new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    process.stdin.once('data', (d) => {
+      process.stdin.pause();
+      resolve(String(d).trim().toLowerCase());
+    });
+  });
+  return answer === 'y' || answer === 'yes';
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +244,7 @@ const commands = {
       comment: flags.comment,
       allowArgv: Boolean(flags['allow-argv']),
     });
-    if (flags['clear-clipboard']) execFileSync('pbcopy', { input: '' });
+    if (flags['clear-clipboard']) execFileSync(PBCOPY, { input: '', env: safeEnv() });
     process.stderr.write(`Stored ${formatRef(ref)}\n`);
   },
 
@@ -225,6 +285,33 @@ const commands = {
     return results.some((r) => !r.present && !r.optional) ? 1 : 0;
   },
 
+  async trust({ flags }) {
+    const file = flags.manifest ?? DEFAULT_MANIFEST;
+    const store = trustStoreOf(flags);
+    const manifest = loadManifest(file, { defaultService: flags.service });
+    if (!manifest) throw new KeychainError(`Manifest not found: ${file}`, { code: 'MANIFEST_NOT_FOUND' });
+    process.stderr.write(`Manifest ${manifest.path} requests:\n`);
+    for (const e of manifest.entries) {
+      process.stderr.write(`  ${e.name.padEnd(28)} ${formatRef(e, e.name)}${e.optional ? ' (optional)' : ''}\n`);
+    }
+    const services = [...new Set(manifest.entries.map((e) => e.service))].sort();
+    process.stderr.write(`Services: ${services.join(', ') || '(none)'}\n`);
+    if (!flags.yes && !(await confirm('Allow processes started from this manifest to read these items? [y/N] '))) {
+      process.stderr.write(process.stdin.isTTY ? 'Not trusted.\n' : 'Not trusted (non-interactive: pass --yes).\n');
+      return 1;
+    }
+    trustManifest(file, { defaultService: flags.service, store });
+    process.stderr.write(`Trusted ${manifest.path}\n`);
+    return 0;
+  },
+
+  async untrust({ flags }) {
+    const file = flags.manifest ?? DEFAULT_MANIFEST;
+    const removed = untrustManifest(file, { store: trustStoreOf(flags) });
+    process.stderr.write(removed ? `Revoked trust for ${file}\n` : `${file} was not trusted\n`);
+    return removed ? 0 : 1;
+  },
+
   async run({ flags, rest }, kc) {
     if (rest.length === 0) throw new UsageError('Usage: keychain-env run [options] -- <command> [args...]');
     const env = { ...process.env };
@@ -254,8 +341,31 @@ const commands = {
     if (path.resolve(file) === path.resolve(manifestPath)) {
       throw new UsageError('The source file and the manifest must be different files');
     }
+    const store = trustStoreOf(flags);
+    // Re-approve the merged manifest only if nothing unreviewed is carried over:
+    // either there was no manifest, or the existing one was already trusted.
+    const before = loadManifest(manifestPath);
+    let carryTrust = !before;
+    if (before) {
+      try {
+        assertManifestTrusted(before, { store });
+        carryTrust = true;
+      } catch {
+        carryTrust = false;
+      }
+    }
     const only = flags.keys ? new Set(flags.keys.split(',').map((k) => k.trim())) : undefined;
     const entries = parseDotenv(readFileSync(file, 'utf8')).filter(([k]) => !only || only.has(k));
+
+    // Validate everything before writing anything to the keychain.
+    for (const [name, value] of entries) {
+      validateEnvName(name, { where: file });
+      if (isRef(value)) {
+        // A reference copied from the source file was not reviewed by the user;
+        // do not let it ride along on an automatic approval.
+        if (parseRef(value, name).service !== flags.service) carryTrust = false;
+      }
+    }
 
     const refs = new Map();
     const skipped = [];
@@ -291,10 +401,14 @@ const commands = {
     const output = `${merged.join('\n')}\n`;
     parseManifest(output, { file: manifestPath }); // validate before writing
     writeFileSync(manifestPath, output);
+    if (carryTrust) trustManifest(manifestPath, { store });
 
     process.stderr.write(
       `\nImported ${refs.size} variable(s) into ${manifestPath}.` +
         (skipped.length ? ` Skipped empty: ${skipped.join(', ')}.` : '') +
+        (carryTrust
+          ? ` The manifest is trusted.`
+          : ` The existing manifest was not trusted, so review it and run \`keychain-env trust\`.`) +
         `\n${file} was NOT modified. Verify with \`keychain-env check\`, then remove the plaintext values from ${file}.\n`,
     );
   },
@@ -318,7 +432,12 @@ async function main(argv) {
     process.stdout.write(USAGE);
     return 0;
   }
-  const kc = createKeychain({ timeoutMs: timeoutOf(parsed.flags) ?? 30_000, keychain: parsed.flags.keychain });
+  const kc = createKeychain({
+    timeoutMs: timeoutOf(parsed.flags) ?? 30_000,
+    keychain: parsed.flags.keychain,
+    securityPath: parsed.flags['security-bin'],
+    trustStore: parsed.flags['trust-store'] === undefined ? undefined : trustStoreOf(parsed.flags),
+  });
   return (await handler(parsed, kc)) ?? 0;
 }
 

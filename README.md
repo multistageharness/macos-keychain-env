@@ -30,6 +30,7 @@ npm install macos-keychain-env            # or: npm install -g macos-keychain-en
 
 keychain-env set my-project OPENAI_API_KEY      # hidden prompt
 echo 'OPENAI_API_KEY=keychain://my-project' >> .env.keychain
+keychain-env trust                              # review + approve the manifest (once per change)
 keychain-env check                              # ok / MISSING, never prints values
 
 keychain-env run -- npm run dev                 # any command, any language
@@ -39,7 +40,7 @@ node --import macos-keychain-env/register app.js   # Node, zero code changes
 Migrate an existing `.env`:
 
 ```bash
-keychain-env import .env --service my-project   # stores values, writes .env.keychain
+keychain-env import .env --service my-project   # stores values, writes and trusts .env.keychain
 keychain-env check && rm .env                   # .env itself is never modified by import
 ```
 
@@ -71,7 +72,9 @@ types ship in `index.d.ts`.
 | `checkEnv(opts)` | `[{ name, present, optional, ... }]` without reading values |
 | `resolveEnv(target?)` | Replace `keychain://` values in an object (default `process.env`) |
 | `secretProvider(ref, { ttlMs })` | Lazy cached async getter for SDKs |
-| `createKeychain(options)` | Separate client: `keychain`, `timeoutMs`, `concurrency`, `cacheTtlMs`, `service` |
+| `createKeychain(options)` | Separate client: `keychain`, `timeoutMs`, `concurrency`, `cacheTtlMs`, `service`, `allowedServices`, `trustStore` |
+| `trustManifest(file)` / `untrustManifest(file)` | Approve or revoke a manifest (what `keychain-env trust` does) |
+| `redact(text, secrets?)` | Mask known secrets of any length (plain and hex) for logs |
 
 ### `loadEnv` semantics
 
@@ -82,8 +85,12 @@ types ship in `index.d.ts`.
   listing *all* of them, and nothing is written.
 - **Concurrent:** items are fetched in parallel, up to `concurrency` (default 4)
   `security` processes at a time.
+- **Trusted manifests only:** a manifest is refused (`UNTRUSTED_MANIFEST`) until it is
+  approved, and again after any edit. See [Trust boundary](#trust-boundary).
 - Works with dotenv: `.env` may contain `API_KEY=keychain://my-project`. Run
-  `dotenv.config()` first, then `loadEnv()` replaces the reference.
+  `dotenv.config()` first, then `loadEnv()` replaces the reference. Such references may
+  only name services that your code (`keys` / `entries`), a trusted manifest, or
+  `allowedServices` already permits; anything else is `SERVICE_NOT_ALLOWED`.
 - Returns `{ loaded, skipped, missing }`. These are names only, never values.
 
 ## Async design
@@ -110,7 +117,8 @@ keychain-env get | has | delete | ref <service> <account>     (or a single keych
 keychain-env check [--manifest f] [--json]
 keychain-env run [--manifest f] [--no-manifest] [--override] -- <cmd> [args...]
 keychain-env import <file> --service <name> [--keys A,B] [--manifest f]
-global: --keychain <path>  --timeout <ms>
+keychain-env trust [--manifest f] [--yes]  |  keychain-env untrust [--manifest f]
+global: --keychain <path>  --timeout <ms>  --allow-service <name>
 ```
 
 `set` has no value argument on purpose: values come from a hidden prompt, stdin, or
@@ -119,8 +127,8 @@ the clipboard, so they never end up in shell history.
 ### Bash scripts (no Node required)
 
 Standalone scripts in `bin/` call `/usr/bin/security` directly, with the same
-safeguards (stdin hex writes, line-limit check, `-g` parsing). They work with macOS's
-built-in bash 3.2.
+safeguards (stdin hex writes, line-limit check, `-g` parsing, identifier validation,
+absolute tool paths, `#!/bin/bash -p`). They work with macOS's built-in bash 3.2.
 
 ```bash
 bin/keychain-add.sh    <service> <account> [--stdin | --from-clipboard] [--keychain p] [--allow-argv]   # fails if it exists
@@ -134,6 +142,24 @@ Without `--stdin` or `--from-clipboard`, add and update prompt twice with hidden
 when run in a terminal, and read stdin otherwise. Exit codes: 0 success, 1 error
 (not found, already exists, too large, …), 2 usage.
 
+## Trust boundary
+
+A `.env.keychain` manifest arrives with the repository, so it's untrusted input: a cloned
+project could otherwise map variables to *another* project's items
+(`STOLEN=keychain://aws-prod/secret-access-key`) and receive them via `run` or the preload.
+
+- **Manifests must be approved.** `keychain-env trust` shows every requested item and
+  service, then records the manifest's SHA-256 and approved services in
+  `~/.config/keychain-env/trusted-manifests.json` (home taken from the user database, not
+  `$HOME`; file `0600`, directory `0700`, symlinks and group/world-writable files refused).
+  Any edit, or a different default service for bare lines, needs a new approval.
+  `import` auto-approves only a manifest it wrote from scratch or one already trusted, and
+  never one carrying references to other services.
+- **Environment references are confined.** `keychain://` values in the environment may only
+  name services (and keychain files) already used by code or a trusted manifest.
+- **Hard allowlist.** `allowedServices` / `--allow-service` caps every source.
+- **Opt-out is code-only:** `requireTrustedManifest: false` for apps that ship their own manifest.
+
 ## Security notes
 
 - Values are passed to `security` as hex **over stdin** (`security -i`), never argv.
@@ -146,7 +172,21 @@ when run in a terminal, and read stdin otherwise. Exit codes: 0 success, 1 error
   running as your user can read them without a prompt. That is the same trust level as
   a `.env` file, but the secrets are encrypted at rest, can't be committed by accident,
   and live in one place. Use `trustedApps: [""]` to require a prompt on every read.
-- Error messages redact hex runs and never include values.
+- **Identifiers are validated** before reaching `security`: services, accounts and labels
+  can't start with `-` (option injection such as a keychain of `-A`, "allow any app"),
+  contain control or invisible characters, or have surrounding whitespace; keychains must
+  be absolute paths or bare `*.keychain(-db)` names; `keychain://` references reject unknown
+  or repeated parameters. Manifests can't set `PATH`, `NODE_OPTIONS`, `DYLD_*`, `LD_*` and
+  similar execution-control variables.
+- **No binary hijacking:** `/usr/bin/security`, `/usr/bin/pbpaste` and `/usr/bin/pbcopy`
+  are run by absolute path with a fixed environment (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
+  `LC_ALL=C`, nothing else inherited). The binary can't be overridden through environment
+  variables; `securityPath` (code) / `--security-bin` (CLI, for tests) must be an absolute
+  file owned by root or you and not writable by others.
+- **Redaction:** write errors never include `security`'s output, because it can echo the
+  hex-encoded value and no length-based rule masks short secrets (PINs) safely. Spawn errors
+  carry only `code`/`errno`/`syscall`, not argv. `redact(text, secrets)` masks known secrets
+  of any length.
 
 ## Agent skill
 

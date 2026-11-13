@@ -33,6 +33,10 @@ await loadEnv({ service: 'my-project', keys: ['OPENAI_API_KEY', 'DATABASE_URL'] 
 Works alongside dotenv: a `.env` may contain `API_KEY=keychain://my-project`,
 and `loadEnv()` (which runs `resolveEnv`) replaces it after `dotenv.config()`.
 
+Manifests must be approved first (`keychain-env trust`), or loading fails with
+`UNTRUSTED_MANIFEST`. `keychain://` values in the environment may only name services the
+app's code or trusted manifest already uses; pass `allowedServices` to set an explicit list.
+
 `loadEnv` is all-or-nothing. If any required secret is missing, it throws
 `MissingSecretsError` (listing all of them) and sets nothing.
 

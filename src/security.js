@@ -13,17 +13,76 @@
  * - The `-w` prompt path truncates silently at 128 bytes, so it is never used.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { KeychainError, errorFromExit, redact } from './errors.js';
+import { statSync } from 'node:fs';
+import { userInfo } from 'node:os';
+import path from 'node:path';
+import { KeychainError, errorFromExit } from './errors.js';
 
 export const DEFAULT_SECURITY_PATH = '/usr/bin/security';
 export const MAX_INTERACTIVE_LINE = 4000;
+export const MAX_NAME_LENGTH = 255;
+const MAX_KEYCHAIN_PATH = 1024;
+
+// ---------------------------------------------------------------------------
+// Binary resolution and process environment
+//
+// The binary is never looked up on PATH or taken from an environment variable:
+// a rogue .env (loaded by dotenv before us) must not be able to swap in a
+// program that would receive secrets on stdin. Only code can override it, via
+// the `securityPath` option, and the override must be a safe absolute path.
+// ---------------------------------------------------------------------------
+
+const verifiedBinaries = new Set();
+
+/** Throw unless `file` is an absolute, regular file only root or this user can modify. */
+export function assertSafeExecutable(file, what = 'securityPath') {
+  if (typeof file !== 'string' || !path.isAbsolute(file) || /[\0-\x1f\x7f]/.test(file)) {
+    throw new KeychainError(`${what} must be an absolute path`, { code: 'INVALID_ARGUMENT' });
+  }
+  if (verifiedBinaries.has(file)) return file;
+  let st;
+  try {
+    st = statSync(file);
+  } catch {
+    throw new KeychainError(`${what} does not exist: ${file}`, {
+      code: process.platform === 'darwin' ? 'SECURITY_NOT_FOUND' : 'UNSUPPORTED_PLATFORM',
+    });
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  if (!st.isFile()) throw new KeychainError(`${what} is not a regular file: ${file}`, { code: 'UNSAFE_BINARY' });
+  if (st.mode & 0o022) {
+    throw new KeychainError(`${what} is writable by group or others: ${file}`, { code: 'UNSAFE_BINARY' });
+  }
+  if (st.uid !== 0 && st.uid !== uid) {
+    throw new KeychainError(`${what} must be owned by root or the current user: ${file}`, { code: 'UNSAFE_BINARY' });
+  }
+  verifiedBinaries.add(file);
+  return file;
+}
 
 export function securityPath(opts = {}) {
-  return opts.securityPath ?? process.env.KEYCHAIN_ENV_SECURITY_BIN ?? DEFAULT_SECURITY_PATH;
+  return opts.securityPath === undefined ? DEFAULT_SECURITY_PATH : assertSafeExecutable(opts.securityPath);
+}
+
+/**
+ * Minimal, fixed environment for child processes. Nothing from process.env is
+ * passed through, so PATH, DYLD_*, locale or other injected variables cannot
+ * change which binaries run or how their output is formatted.
+ */
+export function safeEnv() {
+  const { username, homedir } = userInfo();
+  return {
+    PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+    HOME: homedir,
+    USER: username,
+    LOGNAME: username,
+    LANG: 'C',
+    LC_ALL: 'C',
+  };
 }
 
 export function assertSupported(opts = {}) {
-  if (process.platform !== 'darwin' && !opts.securityPath && !process.env.KEYCHAIN_ENV_SECURITY_BIN) {
+  if (process.platform !== 'darwin' && opts.securityPath === undefined) {
     throw new KeychainError(
       `The macOS keychain is not available on platform "${process.platform}". ` +
         'Provide the variables through the environment instead (existing env vars always take precedence).',
@@ -32,18 +91,53 @@ export function assertSupported(opts = {}) {
   }
 }
 
-function validateName(kind, value) {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new KeychainError(`Keychain ${kind} must be a non-empty string`, { code: 'INVALID_ARGUMENT' });
-  }
-  if (/[\0\r\n]/.test(value)) {
-    throw new KeychainError(`Keychain ${kind} must not contain newlines or NUL`, { code: 'INVALID_ARGUMENT' });
-  }
+// ---------------------------------------------------------------------------
+// Identifier validation
+//
+// Everything that reaches `security` is validated so it can only ever be read
+// as the value it is meant to be: no option-like leading "-", no control or
+// invisible formatting characters, no surrounding whitespace, bounded length.
+// ---------------------------------------------------------------------------
+
+// C0/C1 controls, DEL, and zero-width / bidi formatting characters (lookalike tampering).
+const FORBIDDEN_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+
+function invalid(message) {
+  return new KeychainError(message, { code: 'INVALID_ARGUMENT' });
 }
 
-export function validateRef({ service, account }) {
+/** Validate a service, account, label or comment. */
+export function validateName(kind, value, { max = MAX_NAME_LENGTH } = {}) {
+  if (typeof value !== 'string' || value.length === 0) throw invalid(`Keychain ${kind} must be a non-empty string`);
+  if (value.length > max) throw invalid(`Keychain ${kind} must be at most ${max} characters`);
+  if (FORBIDDEN_CHARS.test(value)) throw invalid(`Keychain ${kind} must not contain control or invisible characters`);
+  if (value.trim() !== value) throw invalid(`Keychain ${kind} must not start or end with whitespace`);
+  if (value.startsWith('-')) throw invalid(`Keychain ${kind} must not start with "-"`);
+}
+
+/**
+ * A keychain is either a bare file name (`team.keychain-db`, resolved by macOS
+ * in ~/Library/Keychains) or an absolute path, and must end in `.keychain` or
+ * `.keychain-db`.
+ */
+export function validateKeychain(value) {
+  if (value === undefined) return;
+  validateName('keychain', value, { max: MAX_KEYCHAIN_PATH });
+  if (!/\.keychain(-db)?$/.test(value)) throw invalid('Keychain path must end in .keychain or .keychain-db');
+  if (value.includes('/') && !path.isAbsolute(value)) throw invalid('Keychain path must be absolute or a bare file name');
+  if (value.split('/').includes('..')) throw invalid('Keychain path must not contain ".." segments');
+}
+
+export function validateTrustedApp(value) {
+  if (value === '') return; // `-T ""` trusts no app, so every read prompts.
+  validateName('trusted app', value, { max: MAX_KEYCHAIN_PATH });
+  if (!path.isAbsolute(value)) throw invalid('trustedApps entries must be absolute paths (or "" for none)');
+}
+
+export function validateRef({ service, account, keychain }) {
   validateName('service', service);
   validateName('account', account);
+  validateKeychain(keychain);
 }
 
 /** Quote an argument for the `security -i` command-line parser. */
@@ -83,17 +177,21 @@ export function planSet(ref, value, opts = {}) {
 
   // Each entry is [flag, value]; values get quoted for the interactive parser.
   const pairs = [['-s', ref.service], ['-a', ref.account]];
-  if (opts.label) pairs.push(['-l', opts.label]);
-  if (opts.comment) pairs.push(['-j', opts.comment]);
+  if (opts.label !== undefined) {
+    validateName('label', opts.label);
+    pairs.push(['-l', opts.label]);
+  }
+  if (opts.comment !== undefined) {
+    validateName('comment', opts.comment, { max: 1024 });
+    pairs.push(['-j', opts.comment]);
+  }
+  if (opts.trustedApps !== undefined && !Array.isArray(opts.trustedApps)) {
+    throw new KeychainError('trustedApps must be an array', { code: 'INVALID_ARGUMENT' });
+  }
   for (const app of opts.trustedApps ?? []) {
-    // An empty string is meaningful: `-T ""` trusts no app, so every read prompts.
-    if (typeof app !== 'string' || /[\0\r\n]/.test(app)) {
-      throw new KeychainError('trustedApps entries must be strings without newlines', { code: 'INVALID_ARGUMENT' });
-    }
+    validateTrustedApp(app);
     pairs.push(['-T', app]);
   }
-  if (opts.label) validateName('label', opts.label);
-  if (opts.comment) validateName('comment', opts.comment);
 
   const tail = ref.keychain ? ` ${quoteInteractive(ref.keychain)}` : '';
   const line = `add-generic-password -U ${pairs
@@ -151,7 +249,7 @@ export function runSecurity(args, { input, timeoutMs, signal, ...opts } = {}) {
     }
     let child;
     try {
-      child = spawn(securityPath(opts), args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(securityPath(opts), args, { stdio: ['pipe', 'pipe', 'pipe'], env: safeEnv() });
     } catch (err) {
       reject(spawnError(err, opts));
       return;
@@ -205,6 +303,7 @@ export function runSecurity(args, { input, timeoutMs, signal, ...opts } = {}) {
 export function runSecuritySync(args, { input, timeoutMs, ...opts } = {}) {
   const r = spawnSync(securityPath(opts), args, {
     input: input ?? '',
+    env: safeEnv(),
     timeout: timeoutMs > 0 ? timeoutMs : undefined,
     encoding: 'utf8',
   });
@@ -217,14 +316,18 @@ export function runSecuritySync(args, { input, timeoutMs, ...opts } = {}) {
   return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
+// Node's spawn errors carry `spawnargs`, which hold the hex-encoded value when
+// writing via argv. Never attach the raw error: keep only non-sensitive fields.
 function spawnError(err, opts) {
+  if (err instanceof KeychainError) return err;
+  const cause = { code: err?.code, errno: err?.errno, syscall: err?.syscall };
   if (err?.code === 'ENOENT') {
     return new KeychainError(`macOS security tool not found at ${securityPath(opts)}`, {
       code: process.platform === 'darwin' ? 'SECURITY_NOT_FOUND' : 'UNSUPPORTED_PLATFORM',
-      cause: err,
+      cause,
     });
   }
-  return new KeychainError(`Failed to run security: ${err?.message ?? err}`, { cause: err });
+  return new KeychainError(`Failed to run security (${err?.code ?? 'unknown error'})`, { cause });
 }
 
 function abortError(signal) {
@@ -261,7 +364,9 @@ export function interpretSet(r, ref) {
   // `security -i` propagates the command's exit status; also treat a reported
   // "returned <status>" or "unknown command" on stderr as failure, defensively.
   if (r.exitCode !== 0 || /returned -?\d+/.test(r.stderr) || /unknown command/.test(r.stderr)) {
-    throw errorFromExit({ ...r, stderr: redact(r.stderr), op: 'add-generic-password', ...ref });
+    // stderr can echo the command line, including the hex-encoded value, and no
+    // length-based heuristic can reliably mask a short secret. Withhold it.
+    throw errorFromExit({ exitCode: r.exitCode, stderr: '', op: 'add-generic-password', withheld: true, ...ref });
   }
 }
 

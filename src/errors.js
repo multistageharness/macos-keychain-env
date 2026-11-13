@@ -54,21 +54,49 @@ const EXIT_CODES = {
   128: ['USER_CANCELED', 'the user denied or canceled the keychain access prompt'],
 };
 
-/** Hex runs this long might be value data echoed back by `security -i`. */
-const HEX_RUN = /\b[0-9a-fA-F]{16,}\b/g;
-
-export function redact(text) {
-  return String(text ?? '').replace(HEX_RUN, '[redacted]').trim();
+/**
+ * Remove secret material from text before it is shown or logged.
+ *
+ * Every known secret is masked whatever its length, in plain, hex (both cases)
+ * and `0x`-hex forms, so a 2-character PIN is masked as reliably as a 64-character
+ * key. On top of that, generic patterns catch material we were not told about:
+ * `password:` lines from `security -g`, `-X <hex>` / `-w <value>` arguments, and
+ * any run of 8+ hex digits.
+ * @param {unknown} text
+ * @param {Array<string|Buffer>} [secrets]
+ */
+export function redact(text, secrets = []) {
+  let out = String(text ?? '');
+  const needles = new Set();
+  for (const secret of secrets) {
+    if (secret === undefined || secret === null) continue;
+    const buf = Buffer.from(secret);
+    if (buf.length === 0) continue;
+    needles.add(buf.toString('utf8'));
+    needles.add(buf.toString('hex'));
+    needles.add(buf.toString('hex').toUpperCase());
+  }
+  // Longest first so a secret that contains another is masked whole.
+  for (const needle of [...needles].sort((x, y) => y.length - x.length)) {
+    out = out.split(needle).join('[redacted]');
+  }
+  return out
+    .replace(/^(\s*password:).*$/gim, '$1 [redacted]')
+    .replace(/(\s-[XwpP])\s+("[^"]*"|\S+)/g, '$1 [redacted]')
+    .replace(/\b(?:0x)?[0-9a-fA-F]{8,}\b/g, '[redacted]')
+    .trim();
 }
 
 /**
  * Turn a failed `security` invocation into a KeychainError.
- * @param {{ exitCode: number|null, stderr: string, op: string, service?: string, account?: string }} r
+ * @param {{ exitCode: number|null, stderr: string, op: string, service?: string, account?: string, withheld?: boolean }} r
  */
-export function errorFromExit({ exitCode, stderr, op, service, account }) {
+export function errorFromExit({ exitCode, stderr, op, service, account, withheld = false }) {
   if (exitCode === 44 && service !== undefined) return new SecretNotFoundError(service, account);
   const known = exitCode == null ? undefined : EXIT_CODES[exitCode];
-  const detail = redact(stderr).split('\n').filter(Boolean).pop();
+  const detail = withheld
+    ? 'security output withheld because it may echo the secret'
+    : redact(stderr).split('\n').filter(Boolean).pop();
   const where = service === undefined ? '' : ` (service="${service}" account="${account}")`;
   const message = `security ${op} failed${where}: ${known ? known[1] : `exit code ${exitCode}`}${
     detail ? ` — ${detail}` : ''

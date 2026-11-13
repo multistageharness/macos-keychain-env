@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { MissingSecretsError, SecretNotFoundError } from '../src/index.js';
+import { MissingSecretsError, SecretNotFoundError, trustManifest } from '../src/index.js';
 import { fakeKeychain } from './helpers.js';
 
 test('set/get/has/delete round-trip, including awkward values', async () => {
@@ -66,13 +66,14 @@ test('timeout and AbortSignal', async () => {
 });
 
 test('loadEnv: manifest, keys, entries, refs in env, existing values win', async () => {
-  const { kc, dir } = fakeKeychain();
+  const { kc, dir, trustStore } = fakeKeychain();
   await kc.set('keychain://app/A', 'a-secret');
   await kc.set('keychain://app/B', 'b-secret');
-  await kc.set('keychain://other/token', 'c-secret');
+  await kc.set('keychain://app/token', 'c-secret');
   await kc.set('keychain://app/D', 'd-secret');
   writeFileSync(path.join(dir, '.env.keychain'), 'A=keychain://app\nOPT=keychain://app/none?optional\n');
-  const target = { B: 'from-ci', C: 'keychain://other/token' };
+  trustManifest('.env.keychain', { cwd: dir, store: trustStore });
+  const target = { B: 'from-ci', C: 'keychain://app/token' };
   const result = await kc.loadEnv({ cwd: dir, target, keys: ['B'], service: 'app', entries: { D: 'keychain://app/D' } });
   assert.deepEqual(target, { A: 'a-secret', B: 'from-ci', C: 'c-secret', D: 'd-secret' });
   assert.deepEqual(result.skipped, ['B']);
@@ -103,9 +104,10 @@ test('loadEnv does not touch the keychain when nothing needs fetching', async ()
 });
 
 test('loadEnvSync and checkEnv', async () => {
-  const { kc, dir } = fakeKeychain();
+  const { kc, dir, trustStore } = fakeKeychain();
   await kc.set('keychain://app/A', 'a');
   writeFileSync(path.join(dir, 'm.env'), 'A=keychain://app\nB=keychain://app\nC=keychain://app?optional\n');
+  trustManifest('m.env', { cwd: dir, store: trustStore });
   const checks = await kc.checkEnv({ cwd: dir, manifest: 'm.env' });
   assert.deepEqual(
     checks.map((c) => [c.name, c.present, c.optional]),

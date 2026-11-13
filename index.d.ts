@@ -20,12 +20,21 @@ export interface KeychainOptions {
   concurrency?: number;
   /** Cache successful reads for this many ms (default 0 = no cache). */
   cacheTtlMs?: number;
-  /** Default keychain file for refs that do not name one. */
+  /** Default keychain: absolute path or bare file name ending in .keychain / .keychain-db. */
   keychain?: string;
   /** Default service for bare manifest lines and `keys`. */
   service?: string;
-  /** Path to the `security` binary (default /usr/bin/security, or $KEYCHAIN_ENV_SECURITY_BIN). */
+  /**
+   * Absolute path to the `security` binary (default /usr/bin/security). Must be a regular file
+   * owned by root or the current user and not writable by others. Never read from the environment.
+   */
   securityPath?: string;
+  /** Hard allowlist: every reference from any source must use one of these services. */
+  allowedServices?: string[];
+  /** Require manifests to be approved with `keychain-env trust` / trustManifest() (default true). */
+  requireTrustedManifest?: boolean;
+  /** Absolute path of the trust store (default ~/.config/keychain-env/trusted-manifests.json). */
+  trustStore?: string;
 }
 
 export interface CallOptions {
@@ -68,6 +77,13 @@ export interface LoadEnvOptions extends CallOptions {
   target?: Record<string, string | undefined>;
   /** Base directory for the manifest (default process.cwd()). */
   cwd?: string;
+  /**
+   * Services that may be loaded. Without it, `keychain://` values found in `target` may only name
+   * services used by `keys`, `entries` or a trusted manifest.
+   */
+  allowedServices?: string[];
+  requireTrustedManifest?: boolean;
+  trustStore?: string;
 }
 
 export interface LoadEnvResult {
@@ -160,7 +176,12 @@ export type KeychainErrorCode =
   | 'INVALID_ARGUMENT'
   | 'INVALID_REF'
   | 'INVALID_MANIFEST'
-  | 'MANIFEST_NOT_FOUND';
+  | 'MANIFEST_NOT_FOUND'
+  | 'UNTRUSTED_MANIFEST'
+  | 'SERVICE_NOT_ALLOWED'
+  | 'UNSAFE_TRUST_STORE'
+  | 'UNSAFE_BINARY'
+  | 'CANCELED';
 
 export declare class KeychainError extends Error {
   code: KeychainErrorCode | (string & {});
@@ -180,3 +201,21 @@ export declare function formatRef(ref: SecretRef, varName?: string): string;
 export declare function parseDotenv(source: string): Array<[string, string]>;
 export declare function parseManifest(source: string, options?: { defaultService?: string; file?: string }): Array<SecretRef & { name: string; optional: boolean }>;
 export declare function readManifest(file?: string, options?: { cwd?: string; defaultService?: string }): Array<SecretRef & { name: string; optional: boolean }> | undefined;
+
+/** Mask known secrets (any length; plain and hex) plus generic secret-looking patterns. */
+export declare function redact(text: unknown, secrets?: Array<string | Buffer>): string;
+
+export interface TrustRecord {
+  path: string;
+  sha256: string;
+  services: string[];
+  keychains: string[];
+  trustedAt: string;
+}
+export declare function defaultTrustStore(): string;
+/** Approve a manifest's current content and the services it uses. */
+export declare function trustManifest(
+  file: string,
+  options?: { cwd?: string; defaultService?: string; store?: string },
+): TrustRecord & { entries: Array<SecretRef & { name: string; optional: boolean }> };
+export declare function untrustManifest(file: string, options?: { cwd?: string; store?: string }): boolean;

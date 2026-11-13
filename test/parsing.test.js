@@ -20,7 +20,7 @@ test('parseRef: service/account, defaults, params, percent-encoding', () => {
 
 test('formatRef round-trips and omits account equal to the var name', () => {
   assert.equal(formatRef({ service: 'myapp', account: 'API_KEY' }, 'API_KEY'), 'keychain://myapp');
-  const ref = { service: 'my app', account: 'u@x.com', optional: true, keychain: '/k db' };
+  const ref = { service: 'my app', account: 'u@x.com', optional: true, keychain: '/k db.keychain-db' };
   assert.deepEqual(parseRef(formatRef(ref)), ref);
 });
 

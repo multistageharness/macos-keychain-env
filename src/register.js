@@ -4,7 +4,8 @@
  *   node --import macos-keychain-env/register app.js
  *
  * Loads `.env.keychain` (if present) and resolves any `keychain://` values
- * already in process.env before the app starts. Works for ESM and CommonJS
+ * already in process.env before the app starts. The manifest must have been
+ * approved with `keychain-env trust`; startup fails otherwise. Works for ESM and CommonJS
  * apps. Top-level await guarantees secrets are in place before app code runs.
  *
  * Configure with environment variables:

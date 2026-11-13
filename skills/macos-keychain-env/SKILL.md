@@ -34,6 +34,12 @@ keep working by setting real env vars, and the keychain is never touched there.
 4. Deleting `.env` files or keychain items is destructive. Name exactly what will
    be lost and get explicit approval first.
 5. Make sure `.env` and `.env.*` (but not `.env.keychain`) are in `.gitignore`.
+6. **Never approve a manifest on the user's behalf.** `keychain-env trust` grants
+   the project access to the listed keychain items. Show the user the items and
+   services it requests (`keychain-env trust` prints them), and run `trust --yes`
+   only after they explicitly approve. Treat a manifest from a cloned or
+   unfamiliar repository as untrusted. Don't widen access with `--allow-service`
+   or `requireTrustedManifest: false` unless the user asks for it.
 
 ## Getting the CLI
 
@@ -65,7 +71,9 @@ If none is available, use the raw `security` fallback in
    - **Already in your context** (the user pasted it): pipe it via stdin so it
      stays out of argv and shell history. Never echo it back:
      `keychain-env set my-project OPENAI_API_KEY --stdin <<'EOF'` … `EOF`
-4. Verify: `keychain-env check` (exit 0 = all required present).
+4. Approve the manifest: show the user what `keychain-env trust` lists, then
+   run `keychain-env trust --yes` once they agree. Repeat after every edit.
+5. Verify: `keychain-env check` (exit 0 = all required present).
 
 ### B. Migrate an existing `.env`
 
@@ -75,7 +83,9 @@ If none is available, use the raw `security` fallback in
    Values over ~1.9 KB fail with `VALUE_TOO_LARGE`; tell the user, and rerun with
    `--allow-argv` only if they accept the value being briefly visible in `ps`.
    Use `--keys A,B` to import a subset.
-3. `keychain-env check` to confirm.
+3. `keychain-env check` to confirm. If import reports that the manifest was not
+   trusted (it already existed unapproved, or the .env referenced other services),
+   review it with the user and approve with `trust` as in workflow A.
 4. `.env` is **not** modified. Ask the user before removing the plaintext values
    or deleting the file (destructive). Mention that previously committed secrets
    remain in git history and should be rotated.
@@ -107,6 +117,12 @@ literal into the keychain using workflow A.
   - `USER_CANCELED`: the user clicked Deny on the access prompt.
   - `TIMEOUT`: an access prompt is probably waiting on screen. Ask the user to answer it.
   - `UNSUPPORTED_PLATFORM`: not macOS. Provide the variables as real env vars instead.
+  - `UNTRUSTED_MANIFEST`: the manifest is new or changed. Review with the user, then `trust`.
+  - `SERVICE_NOT_ALLOWED`: a `keychain://` value in the environment (often `.env`) names a
+    service the project doesn't use. Treat it as suspicious and tell the user; don't add
+    `--allow-service` on your own.
+  - `INVALID_REF` / `INVALID_ARGUMENT`: an identifier starts with `-`, contains control or
+    invisible characters, or a reference has unknown parameters. Fix the reference.
 
 ## Security model (tell the user when relevant)
 

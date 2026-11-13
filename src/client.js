@@ -6,8 +6,10 @@
  * - per-call timeout and AbortSignal support.
  */
 import { KeychainError, MissingSecretsError, SecretNotFoundError } from './errors.js';
-import { DEFAULT_MANIFEST, isRef, parseRef, readManifest, toRef } from './refs.js';
+import { DEFAULT_MANIFEST, isRef, parseRef, toRef, validateEnvName } from './refs.js';
+import { assertManifestTrusted, loadManifest } from './trust.js';
 import {
+  assertSafeExecutable,
   assertSupported,
   deleteArgs,
   findArgs,
@@ -18,6 +20,8 @@ import {
   planSet,
   runSecurity,
   runSecuritySync,
+  validateKeychain,
+  validateName,
   validateRef,
 } from './security.js';
 
@@ -83,6 +87,16 @@ const keyOf = ({ service, account, keychain }) => `${keychain ?? ''}\0${service}
  */
 export function createKeychain(options = {}) {
   const config = { ...DEFAULTS, ...options };
+  // Validate configuration up front so a bad value fails at construction time.
+  if (config.securityPath !== undefined) assertSafeExecutable(config.securityPath);
+  validateKeychain(config.keychain);
+  if (config.service !== undefined) validateName('service', config.service);
+  if (config.allowedServices !== undefined) {
+    if (!Array.isArray(config.allowedServices)) {
+      throw new KeychainError('allowedServices must be an array', { code: 'INVALID_ARGUMENT' });
+    }
+    config.allowedServices.forEach((svc) => validateName('service', svc));
+  }
   const limit = createLimiter(Math.max(1, config.concurrency));
   const inflight = new Map();
   const cache = new Map();
@@ -214,32 +228,81 @@ export function createKeychain(options = {}) {
   // Environment loading
   // -------------------------------------------------------------------------
 
-  /** Work out which variables to fetch, without touching the keychain. */
+  /**
+   * Work out which variables to fetch, without touching the keychain.
+   *
+   * Trust boundary: code-supplied `keys` / `entries` and approved manifests
+   * are trusted. `keychain://` values found in the environment (often from a
+   * repository's .env) are not: they may only name services and keychains that
+   * the trusted sources already use. `allowedServices` additionally caps every
+   * source.
+   */
   function planEnv(o = {}) {
     const target = o.target ?? process.env;
     const cwd = o.cwd ?? process.cwd();
     const service = o.service ?? config.service;
+    const allowedList = o.allowedServices ?? config.allowedServices;
+    const allowed = allowedList === undefined ? undefined : new Set(allowedList);
+    const requireTrust = o.requireTrustedManifest ?? config.requireTrustedManifest ?? true;
+    const trustStore = o.trustStore ?? config.trustStore;
     const entries = new Map();
-    const add = (e) => entries.set(e.name, e);
+    const trustedServices = new Set();
+    const trustedKeychains = new Set(config.keychain ? [config.keychain] : []);
+    const add = (e, trusted) => {
+      entries.set(e.name, e);
+      if (trusted) {
+        trustedServices.add(e.service);
+        if (e.keychain) trustedKeychains.add(e.keychain);
+      }
+    };
+    const notAllowed = (name, why) =>
+      new KeychainError(`${name}: ${why}`, { code: 'SERVICE_NOT_ALLOWED' });
 
     if (o.manifest !== false) {
       const file = typeof o.manifest === 'string' ? o.manifest : DEFAULT_MANIFEST;
-      const parsed = readManifest(file, { cwd, defaultService: service });
-      if (!parsed && typeof o.manifest === 'string') {
+      const manifest = loadManifest(file, { cwd, defaultService: service });
+      if (!manifest && typeof o.manifest === 'string') {
         throw new KeychainError(`Manifest not found: ${file}`, { code: 'MANIFEST_NOT_FOUND' });
       }
-      parsed?.forEach(add);
+      if (manifest) {
+        if (requireTrust) assertManifestTrusted(manifest, { store: trustStore });
+        for (const e of manifest.entries) add(e, true);
+      }
     }
     if (o.keys) {
       if (!service) throw new KeychainError('`keys` requires a `service`', { code: 'INVALID_ARGUMENT' });
-      for (const name of o.keys) add({ name, service, account: name, optional: false });
+      for (const name of o.keys) add({ name, ...toRef({ service, account: name }) }, true);
     }
     for (const [name, refInput] of Object.entries(o.entries ?? {})) {
-      add({ name, ...toRef(refInput, name) });
+      add({ name, ...toRef(refInput, name) }, true);
     }
     if (o.resolveRefs !== false) {
       for (const [name, value] of Object.entries(target)) {
-        if (isRef(value)) add({ name, ...parseRef(value, name) });
+        if (!isRef(value)) continue;
+        let ref;
+        try {
+          validateEnvName(name, { where: 'environment' });
+          ref = parseRef(value, name);
+        } catch (err) {
+          throw new KeychainError(`${name}: ${err.message}`, { code: 'INVALID_REF' });
+        }
+        const permitted = allowed ?? trustedServices;
+        if (!permitted.has(ref.service)) {
+          throw notAllowed(
+            name,
+            `keychain:// reference to service "${ref.service}" came from the environment, but that service is not ` +
+              'used by this app\'s code or trusted manifest. Add it to `allowedServices` (CLI: --allow-service) if intended.',
+          );
+        }
+        if (ref.keychain && !trustedKeychains.has(ref.keychain)) {
+          throw notAllowed(name, `keychain "${ref.keychain}" from the environment is not used by a trusted source`);
+        }
+        add({ name, ...ref }, false);
+      }
+    }
+    if (allowed) {
+      for (const e of entries.values()) {
+        if (!allowed.has(e.service)) throw notAllowed(e.name, `service "${e.service}" is not in allowedServices`);
       }
     }
 

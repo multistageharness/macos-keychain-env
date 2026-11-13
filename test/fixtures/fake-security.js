@@ -2,7 +2,9 @@
 // Stand-in for /usr/bin/security used by unit tests. Stores items in the JSON
 // file named by $FAKE_KEYCHAIN_STORE and mimics the real tool's output format
 // and exit codes. $FAKE_KEYCHAIN_DELAY_MS adds latency; $FAKE_KEYCHAIN_LOG
-// appends one line per invocation (to count process spawns).
+// appends one line per invocation (to count process spawns);
+// $FAKE_KEYCHAIN_FAIL_ECHO=1 makes `-i` fail and echo its input like the real
+// tool does. The settings are baked into a per-test wrapper (test/helpers.js).
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const store = process.env.FAKE_KEYCHAIN_STORE;
@@ -95,6 +97,11 @@ if (args[0] === '-i') {
   let input = '';
   for await (const c of process.stdin) input += c;
   let code = 0;
+  if (process.env.FAKE_KEYCHAIN_FAIL_ECHO === '1') {
+    // Mimic real `security -i` on a split line: it echoes the input on stderr.
+    process.stderr.write(`security: unknown command "${input.trim()}"\n${input.trim()}: returned 1\n`);
+    process.exit(1);
+  }
   for (const line of input.split('\n').filter(Boolean)) code = exec(tokenize(line)) || code;
   process.exitCode = code;
 } else {

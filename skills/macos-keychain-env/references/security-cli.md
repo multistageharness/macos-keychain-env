@@ -8,19 +8,24 @@ pitfalls below: `bin/keychain-add.sh`, `bin/keychain-update.sh`, and
 from a hidden prompt, `--stdin`, or `--from-clipboard`).
 
 ```bash
+# Use absolute paths so PATH cannot substitute another binary. Never pass a
+# service, account or keychain that starts with "-" (it would be read as an option).
+
 # Exists? (reads no secret data; exit 0 = yes, 44 = not found)
-security find-generic-password -s my-project -a OPENAI_API_KEY >/dev/null 2>&1; echo $?
+/usr/bin/security find-generic-password -s my-project -a OPENAI_API_KEY >/dev/null 2>&1; echo $?
 
 # Store from the clipboard without the value touching argv or history.
 # `security -i` reads commands from stdin; -X takes hex; -U updates if present.
+# Its output is discarded because on errors it can echo the hex-encoded value.
 printf 'add-generic-password -U -s "my-project" -a "OPENAI_API_KEY" -X %s\n' \
-  "$(pbpaste | tr -d '\n' | xxd -p | tr -d '\n')" | security -i
+  "$(/usr/bin/pbpaste | /usr/bin/tr -d '\n' | /usr/bin/xxd -p | /usr/bin/tr -d '\n')" \
+  | /usr/bin/security -i >/dev/null 2>&1; echo "exit $?"
 
 # Run a command with one secret (value never printed)
-OPENAI_API_KEY="$(security find-generic-password -s my-project -a OPENAI_API_KEY -w)" npm run dev
+OPENAI_API_KEY="$(/usr/bin/security find-generic-password -s my-project -a OPENAI_API_KEY -w)" npm run dev
 
 # Delete (destructive: get approval first)
-security delete-generic-password -s my-project -a OPENAI_API_KEY
+/usr/bin/security delete-generic-password -s my-project -a OPENAI_API_KEY
 ```
 
 Pitfalls (handled by the package, not by raw commands):
